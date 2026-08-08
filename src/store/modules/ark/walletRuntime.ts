@@ -41,6 +41,7 @@ import { buildCofundFromPlay, buildPlayerRevealTx, buildStageTwoTakeAllTx, encod
 import { packets as cwpPackets } from '@arklabshq/contract-workflows-prototype'
 import { initSwaps, destroySwaps } from '@/services/boltz'
 import { singleFlight } from '@/utils/singleFlight'
+import { serialQueue } from '@/utils/serialQueue'
 import {
   getNetwork, getGame as apiGetGame,
   v4Play, v4Cofund, v4CofundFinalize, v4Reveal, v4CooperativeExit,
@@ -149,6 +150,10 @@ export const NETWORK_PRESETS: Record<string, NetworkPreset> = {
 
 // SDK wallet instance (kept outside Vuex state to avoid reactivity issues with complex objects)
 let sdkWallet: Wallet | null = null
+
+// Runs settles one at a time — two at once can grab the same coin, and the loser hangs forever.
+const queueSettle = serialQueue()
+
 // Run at most ONE boarding-settle round at a time. settlementConfig is false (see
 // Wallet.create), so the client settles boarding itself — from BOTH the auto-settle
 // in refreshBalance AND the manual `settle` action. Two concurrent sdkWallet.settle()
@@ -183,7 +188,10 @@ const settleOnce = singleFlight(async (eventCallback?: (event: unknown) => void)
   // frees, wedging BOTH the manual "Settle" button and every future auto-settle
   // for the session. The timeout rejects → the slot frees → the next attempt
   // (or the SDK's own coalesce, once upstream) can proceed.
-  return withTimeout(w.settle(undefined, eventCallback as never), TIMEOUTS.settle, 'settle')
+  // Queued so an offboard can't register a competing intent mid-round.
+  return queueSettle(() =>
+    withTimeout(w.settle(undefined, eventCallback as never), TIMEOUTS.settle, 'settle'),
+  )
 })
 // Auto-reconnect backoff: a failed connect (slow load, arkd blip, reconnect
 // after a redeploy) schedules a retry with capped exponential backoff so the
@@ -571,17 +579,22 @@ export async function sendBitcoin(_ctx: ArkCtx, { address, amount }: { address: 
 }
 
 export async function offboard(_ctx: ArkCtx, { address, amount }: { address: string; amount: number }) {
-  if (!sdkWallet) throw new Error('Wallet not connected')
+  const w = sdkWallet
+  if (!w) throw new Error('Wallet not connected')
 
   // Ramps.offboard deducts its fee from the amount, so it owns the coin selection.
-  const { fees: feeInfo } = await sdkWallet.arkProvider.getInfo()
+  const { fees: feeInfo } = await w.arkProvider.getInfo()
 
-  const txid = await withTimeout(
-    new Ramps(sdkWallet).offboard(address, feeInfo, BigInt(amount)),
-    TIMEOUTS.settle,
-    'offboard',
+  // Queued: an offboard is a settle, so it must not run alongside the auto-settle.
+  const txid = await queueSettle(() =>
+    withTimeout(
+      new Ramps(w).offboard(address, feeInfo, BigInt(amount)),
+      TIMEOUTS.settle,
+      'offboard',
+    ),
   )
 
+  // Outside the queue — refreshBalance can itself fire the boarding auto-settle.
   await _ctx.dispatch('refreshBalance')
 
   return txid
