@@ -31,9 +31,10 @@ import {
   Transaction, ArkAddress,
   RestIndexerProvider, decodeTapscript, CSVMultisigTapscript,
   type ExtendedVirtualCoin, type ArkTxInput,
-  type NetworkName,
-  Ramps,
+  type NetworkName, type FeeInfo, type Network,
+  Ramps, Estimator,
 } from '@arkade-os/sdk'
+import { Address, OutScript } from '@scure/btc-signer'
 import { commitDigit as v3CommitDigit } from 'arkade-coinflip/dist/arkade-win'
 // Subpath import (not the package root) so the browser bundle doesn't pull in
 // the v2 transactions module, which imports Node's `crypto`.
@@ -578,17 +579,70 @@ export async function sendBitcoin(_ctx: ArkCtx, { address, amount }: { address: 
   return txid
 }
 
+// The scriptPubKey behind a Bitcoin address. Decodes against OUR network only:
+// a bech32 address from another chain yields the same script, so accepting one
+// would send real coins to a key that exists nowhere on this chain.
+export function offboardScript(address: string, network: Network): Uint8Array {
+  try {
+    return OutScript.encode(Address(network).decode(address))
+  } catch {
+    throw new Error(`That doesn't look like a valid Bitcoin address for this network: ${address}`)
+  }
+}
+
+// What the server charges to pay an address on-chain — the only fee taken out of the amount.
+export function offboardOutputFee(
+  feeInfo: FeeInfo,
+  address: string,
+  amount: number,
+  network: Network,
+): number {
+  return new Estimator(feeInfo.intentFee ?? {})
+    .evalOnchainOutput({ amount: BigInt(amount), script: hex.encode(offboardScript(address, network)) })
+    .satoshis
+}
+
+// What an exit costs: the recipient gets `amount`, `total` leaves the wallet.
+export async function quoteOffboard(_ctx: ArkCtx, { address, amount }: { address: string; amount: number }) {
+  const w = sdkWallet
+  if (!w) throw new Error('Wallet not connected')
+
+  const { fees: feeInfo } = await w.arkProvider.getInfo()
+  const est = new Estimator(feeInfo.intentFee ?? {})
+
+  // An exit spends every coin you hold, so every coin is charged whatever you send.
+  const vtxos = await w.getVtxos({ withRecoverable: true, withUnrolled: false })
+  let inputFees = 0
+  for (const v of vtxos) {
+    const f = est.evalOffchainInput({
+      amount: BigInt(v.value),
+      type: v.isSwept ? 'recoverable' : 'vtxo',
+      weight: 0,
+      birth: v.createdAt,
+    }).satoshis
+    // Ramps skips coins whose fee exceeds their value, so they cost nothing.
+    if (f >= v.value) continue
+    inputFees += f
+  }
+
+  const fee = offboardOutputFee(feeInfo, address, amount, w.network) + inputFees
+  return { amount, fee, total: amount + fee }
+}
+
 export async function offboard(_ctx: ArkCtx, { address, amount }: { address: string; amount: number }) {
   const w = sdkWallet
   if (!w) throw new Error('Wallet not connected')
 
-  // Ramps.offboard deducts its fee from the amount, so it owns the coin selection.
   const { fees: feeInfo } = await w.arkProvider.getInfo()
+
+  // Ramps subtracts this same fee again, so the recipient ends up with exactly `amount`.
+  // Not the quote's `total`: the per-coin fees come out of the change, not the payout.
+  const grossedUp = BigInt(amount + offboardOutputFee(feeInfo, address, amount, w.network))
 
   // Queued: an offboard is a settle, so it must not run alongside the auto-settle.
   const txid = await queueSettle(() =>
     withTimeout(
-      new Ramps(w).offboard(address, feeInfo, BigInt(amount)),
+      new Ramps(w).offboard(address, feeInfo, grossedUp),
       TIMEOUTS.settle,
       'offboard',
     ),
